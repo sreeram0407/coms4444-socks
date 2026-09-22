@@ -16,11 +16,22 @@ second currency: every pristine replacement must absorb 64 wears before it
 rejoins a saturated drawer, and the household only has 2n wears per day, so
 each new sock consumes 64/(2n) days of the household's wear capacity.
 
-``delta_potential`` estimates future mismatch while the candidate and the
-observed same-colour drawer age together, one expected wash per wear step.
-The geometric replacement target remains stationary, representing continued
-replenishment. The projection uses the target mixture and survival discount, ending at the
-expected wears remaining in the game. Historical observations use recency decay.
+``delta_potential`` is where the drawer's shape enters. The potential of a
+sock is the expected (thresholded) mismatch, over the rest of its life,
+against a same-colour sock drawn from a *target* belief: the decayed histogram
+of every shade we have been offered, blended with the geometric age
+distribution that the household's affordable replacement rate produces in
+steady state. The blend is what lets the policy start churning from a
+pristine drawer: scored against today's drawer alone, a pristine replacement
+looks like an outlier, so a myopic potential never spends. Integrating over
+the sock's remaining life is what makes it spend early enough: a white sock
+three wears behind the mass costs nothing today and 8 points a day from its
+next wear on. Wearing a sock moves it one wash step, so its contribution
+changes by D(washed) - D(now); discarding replaces it with a pristine one, so
+the drawer changes by D(pristine) - D(sock). The second is what decides
+discards: a large gain for a sock stranded behind the mass, a loss for a
+young one that would merge on its own, which is the asymmetry the greedy
+baseline gets wrong half the time.
 
 ``lam`` is not fixed. The controller from the previous player survives: it
 infers the roommates' spend rate from ``total_spent``, banks the shortfall
@@ -54,7 +65,6 @@ from models.sock import (
 	WHITE_START,
 	Color,
 )
-from players.player_3.future_aging import project_life_values
 
 FREE_GAP = 6
 SOCK_COST = PACK_COST / PACK_SIZE
@@ -156,8 +166,6 @@ class Player3(BasePlayer):
 		# Observed-potential cache, valid for one turn (the histogram changes
 		# once per turn, in _observe).
 		self._obs_cache: dict[tuple[Color, int], float] = {}
-		self._future_life_cache: dict[Color, list[float]] = {}
-		self._future_wear_horizon = 0.0
 
 	# ------------------------------------------------------------------
 	# Turn
@@ -166,10 +174,6 @@ class Player3(BasePlayer):
 	def select_socks(self, offered: tuple[int, ...], turn: TurnContext) -> Selection:
 		self._observe(offered, turn.day)
 		lam, max_discards = self._controller(turn)
-		self._future_life_cache.clear()
-		self._future_wear_horizon = max(0, self.days - turn.day) * (
-			2.0 * self.roommates / self.capacity
-		)
 		wear, discard = self._decide(offered, lam, max_discards)
 		if discard:
 			self.credit -= len(discard)
@@ -222,25 +226,29 @@ class Player3(BasePlayer):
 		return best
 
 	def _life_potential(self, color: Color, shade: int) -> float:
-		"""Age the candidate and observed partners together over future wears.
+		"""Expected mismatch over the rest of a sock's life, not just today.
 
-		Cache all candidate ages once per colour per decision. The cache is
-		reset after observation and controller updates, including broke turns.
+		The sock keeps ageing: a white sock three wears behind a pristine mass
+		costs nothing today and 8 points a day from its next wear on. So the
+		potential is the survival-weighted mean of ``_potential`` along the
+		sock's trajectory, with the same per-wear survival ``q`` that defines
+		the target. Once it reaches the cap it stays there, so the tail of the
+		geometric series lumps at the capped shade. ``q`` is bounded below 1
+		so a never-replaced sock still has a finite (50-wear) horizon.
 		"""
-		if color not in self._future_life_cache:
-			masses = [0.0] * (WEARS_TO_CAP + 1)
-			for seen, mass in self.histogram[color].items():
-				masses[age_of(seen)] += mass
-			fade = WHITE_FADE if color is Color.WHITE else BLACK_FADE
-			self._future_life_cache[color] = project_life_values(
-				masses,
-				fade,
-				self.alpha,
-				self.geometric_survival,
-				self.LIFE_SURVIVAL_CAP,
-				self._future_wear_horizon,
-			)
-		return self._future_life_cache[color][age_of(shade)]
+		q = min(self.geometric_survival, self.LIFE_SURVIVAL_CAP)
+		total = 0.0
+		mass = 1.0 - q
+		current = shade
+		steps = 0
+		while not is_worn_out(current) and steps < WEARS_TO_CAP:
+			total += mass * self._potential(color, current)
+			mass *= q
+			current = washed(current)
+			steps += 1
+		# Remaining mass sits at the cap: mass / (1 - q) summed to infinity.
+		total += (mass / (1.0 - q)) * self._potential(color, current)
+		return total
 
 	def _potential(self, color: Color, shade: int) -> float:
 		"""Expected mismatch of ``shade`` against a same-colour sock drawn
